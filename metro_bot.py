@@ -2,80 +2,101 @@
 Toshkent metro yo'llari haqida ma'lumot beruvchi Telegram bot.
 
 /start bosilganda 4ta metro yo'li tugmasi chiqadi. Foydalanuvchi birini
-tanlasa, o'sha yo'lning bekatlar ro'yxati ko'rsatiladi.
+tanlasa, Telegram ICHIDA veb-sahifa ochiladi (Web App) — u yerda bekatlar
+ro'yxati va ular orasida "harakatlanadigan" poyezd animatsiyasi ko'rsatiladi.
+
+DIQQAT: bu animatsiya HAQIQIY GPS ma'lumoti EMAS (Toshkent metrosining
+ochiq real-vaqt API'si yo'q) — bu faqat ishonarli ko'rinishdagi simulyatsiya.
 
 STANSIYALAR RO'YXATINI O'ZINGIZ TO'LDIRING — pastdagi LINES lug'atiga qarang.
 """
 import os
 import logging
+import threading
 
 from dotenv import load_dotenv
 load_dotenv()
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-)
+from flask import Flask, Response
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+from webapp_render import render_line_page
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+# Railway'da "Generate Domain" orqali olingan havola, masalan:
+# https://metrobot-production.up.railway.app  (oxirida / bo'lmasin)
+WEBAPP_BASE_URL = os.environ["WEBAPP_BASE_URL"].rstrip("/")
 
 # ============================================================
-# STANSIYALAR RO'YXATI — o'zingiz to'ldiring.
-# Har bir yo'lning bekatlarini ro'yxat ko'rinishida, kelish
-# tartibida (masalan janubdan shimolga) yozing.
+# STANSIYALAR RO'YXATI — o'zingiz to'ldiring (janubdan-shimolga
+# yoki boshlanish nuqtasidan oxirigacha tartibda yozing).
 # ============================================================
 LINES = {
     "ozbekiston": {
         "title": "O'zbekiston yo'li",
+        "color": "#2196F3",
         "stations": [
             # "Beruniy",
             # "Chorsu",
-            # ... shu yerga to'ldiring
         ],
     },
     "chilonzor": {
         "title": "Chilonzor yo'li",
+        "color": "#E53935",
         "stations": [
             # "Olmazor",
             # "Chilonzor",
-            # ... shu yerga to'ldiring
         ],
     },
     "halqa": {
         "title": "Xalqa yo'li",
+        "color": "#FDD835",
         "stations": [
-            # ... shu yerga to'ldiring
         ],
     },
     "yunusobod": {
         "title": "Yunusobod yo'li",
+        "color": "#43A047",
         "stations": [
-            # ... shu yerga to'ldiring
         ],
     },
 }
 
+# ============================================================
+# VEB-SERVER (Flask) — Telegram Web App shu orqali ochiladi
+# ============================================================
+flask_app = Flask(__name__)
 
+
+@flask_app.route("/line/<line_key>")
+def line_page(line_key):
+    line = LINES.get(line_key)
+    if not line:
+        return Response("Yo'l topilmadi", status=404)
+    html = render_line_page(line["title"], line["color"], line["stations"])
+    return Response(html, mimetype="text/html")
+
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8000))
+    flask_app.run(host="0.0.0.0", port=port)
+
+
+# ============================================================
+# TELEGRAM BOT
+# ============================================================
 def main_menu_keyboard() -> InlineKeyboardMarkup:
-    """4ta metro yo'li tugmasini chiqaradi."""
-    buttons = [
-        [InlineKeyboardButton(LINES["ozbekiston"]["title"], callback_data="line:ozbekiston")],
-        [InlineKeyboardButton(LINES["chilonzor"]["title"], callback_data="line:chilonzor")],
-        [InlineKeyboardButton(LINES["halqa"]["title"], callback_data="line:halqa")],
-        [InlineKeyboardButton(LINES["yunusobod"]["title"], callback_data="line:yunusobod")],
-    ]
-    return InlineKeyboardMarkup(buttons)
+    def btn(key):
+        url = f"{WEBAPP_BASE_URL}/line/{key}"
+        return InlineKeyboardButton(LINES[key]["title"], web_app=WebAppInfo(url=url))
 
-
-def back_keyboard() -> InlineKeyboardMarkup:
-    """Bosh menyuga qaytish tugmasi."""
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Orqaga", callback_data="back")]])
+    return InlineKeyboardMarkup(
+        [[btn("ozbekiston")], [btn("chilonzor")], [btn("halqa")], [btn("yunusobod")]]
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -85,44 +106,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()  # Telegram'ga "bosildi" signalini yuborish
-
-    if query.data == "back":
-        await query.edit_message_text(
-            "🚇 Toshkent metro yo'nalishlaridan birini tanlang:",
-            reply_markup=main_menu_keyboard(),
-        )
-        return
-
-    # "line:xxx" formatidan kalitni ajratib olamiz
-    line_key = query.data.split(":", 1)[1]
-    line = LINES.get(line_key)
-
-    if not line or not line["stations"]:
-        await query.edit_message_text(
-            f"🚇 {line['title'] if line else ''}\n\n"
-            "Bu yo'l uchun bekatlar ro'yxati hali kiritilmagan.",
-            reply_markup=back_keyboard(),
-        )
-        return
-
-    stations_text = "\n".join(f"{i+1}. {name}" for i, name in enumerate(line["stations"]))
-    await query.edit_message_text(
-        f"🚇 <b>{line['title']}</b>\n\n{stations_text}",
-        parse_mode="HTML",
-        reply_markup=back_keyboard(),
-    )
-
-
 def main():
+    # Flask serverni alohida oqimda (thread) ishga tushiramiz,
+    # shunda u Telegram bot bilan bir vaqtda ishlaydi.
+    threading.Thread(target=run_flask, daemon=True).start()
+
     application = Application.builder().token(TELEGRAM_TOKEN).build()
-
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(handle_button))
 
-    logger.info("Metro bot ishga tushdi...")
+    logger.info("Metro bot va veb-server ishga tushdi...")
     application.run_polling()
 
 
